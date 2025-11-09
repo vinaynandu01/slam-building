@@ -207,7 +207,8 @@ class TunedFeatureTrackingSLAM:
         # Pose tracking
         self.pose = np.zeros(3, dtype=float)
         self.pose_at_last_keyframe = np.zeros(3, dtype=float)
-        self.trajectory = []
+        self.keyframe_trajectory = []  # Stores ALL keyframe poses
+        self.recent_trajectory = deque(maxlen=50)  # Rolling window of last 50 frames
         self.path_distance = 0.0
         self.meter_markers = []
         
@@ -699,9 +700,13 @@ class TunedFeatureTrackingSLAM:
         self.pose_at_last_keyframe = self.pose.copy()
         self.keyframe_counter += 1
         self.frames_since_last_keyframe = 0  # Reset cooldown
-        
+
+        # Store keyframe trajectory point and clear recent trajectory
+        self.keyframe_trajectory.append(self.pose.copy())
+        self.recent_trajectory.clear()
+
         print(f"✅ KF#{keyframe.id} created | Reason: {self.last_keyframe_trigger_reason}")
-        
+
         return keyframe
     
     def _initialize_first_frame(self, gray, depth_map, kp_orb, desc_orb, features_3d, keypoints_2d):
@@ -805,8 +810,9 @@ class TunedFeatureTrackingSLAM:
             else:
                 self.translation_magnitude = 0.0
                 self.rotation_magnitude = 0.0
-        
-        self.trajectory.append(self.pose.copy())
+
+        # Append to recent trajectory (rolling window of 50 frames)
+        self.recent_trajectory.append(self.pose.copy())
         
         # FEATURE TRACKING
         if self.prev_gray is not None:
@@ -934,17 +940,25 @@ class TunedFeatureTrackingSLAM:
                 brightness = int(np.clip(200.0 / (feat['z'] + 0.5), 40, 255))
                 cv2.circle(canvas, (sx, sy), 2, (brightness, brightness, brightness), -1)
         
-        # ORANGE trajectory
-        if len(self.trajectory) > 1:
-            points = []
-            for (x, y, _) in self.trajectory:
-                px, py = project(x, y)
-                if 0 <= px < size and 0 <= py < size:
-                    points.append((px, py))
-            
-            if len(points) > 1:
-                for i in range(len(points) - 1):
-                    cv2.line(canvas, points[i], points[i+1], (0, 165, 255), 3, cv2.LINE_AA)
+        # ORANGE trajectory: Draw keyframe path + recent 50 frames
+        all_trajectory_points = []
+
+        # Add all keyframe trajectory points
+        for (x, y, _) in self.keyframe_trajectory:
+            px, py = project(x, y)
+            if 0 <= px < size and 0 <= py < size:
+                all_trajectory_points.append((px, py))
+
+        # Add recent 50 frame trajectory points
+        for (x, y, _) in self.recent_trajectory:
+            px, py = project(x, y)
+            if 0 <= px < size and 0 <= py < size:
+                all_trajectory_points.append((px, py))
+
+        # Draw connected path
+        if len(all_trajectory_points) > 1:
+            for i in range(len(all_trajectory_points) - 1):
+                cv2.line(canvas, all_trajectory_points[i], all_trajectory_points[i+1], (0, 165, 255), 3, cv2.LINE_AA)
         
         # Meter markers
         for marker in self.meter_markers:

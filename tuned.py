@@ -969,14 +969,10 @@ class TunedFeatureTrackingSLAM:
         cv2.putText(vis, f"Dist: {dist_since_kf:.3f}m | Rot: {math.degrees(rot_since_kf):.1f}°", 
                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 200, 255), 2)
         y += 25
-        
-        cv2.putText(vis, f"Map: {self.feature_counts['stored']}/{self.max_map_features}",
-                   (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        
-        y += 25
+
         cv2.putText(vis, f"Keyframes: {len(self.keyframes_info) + (1 if self.current_keyframe else 0)}",
                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        
+
         y += 25
         if self.matched_keyframe_id is not None:
             cv2.putText(vis, f"🎯 Matched KF#{self.matched_keyframe_id}",

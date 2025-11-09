@@ -207,7 +207,7 @@ class TunedFeatureTrackingSLAM:
         # Pose tracking
         self.pose = np.zeros(3, dtype=float)
         self.pose_at_last_keyframe = np.zeros(3, dtype=float)
-        self.trajectory = []
+        self.keyframe_trajectory = []  # Stores ONLY keyframe poses for trajectory line
         self.path_distance = 0.0
         self.meter_markers = []
         
@@ -699,9 +699,12 @@ class TunedFeatureTrackingSLAM:
         self.pose_at_last_keyframe = self.pose.copy()
         self.keyframe_counter += 1
         self.frames_since_last_keyframe = 0  # Reset cooldown
-        
+
+        # Store ONLY keyframe pose in trajectory
+        self.keyframe_trajectory.append(self.pose.copy())
+
         print(f"✅ KF#{keyframe.id} created | Reason: {self.last_keyframe_trigger_reason}")
-        
+
         return keyframe
     
     def _initialize_first_frame(self, gray, depth_map, kp_orb, desc_orb, features_3d, keypoints_2d):
@@ -805,9 +808,7 @@ class TunedFeatureTrackingSLAM:
             else:
                 self.translation_magnitude = 0.0
                 self.rotation_magnitude = 0.0
-        
-        self.trajectory.append(self.pose.copy())
-        
+
         # FEATURE TRACKING
         if self.prev_gray is not None:
             self.track_old_features(gray)
@@ -927,24 +928,27 @@ class TunedFeatureTrackingSLAM:
             sy = int(cam_screen_y - dy * scale)
             return sx, sy
         
-        # Draw map features
+        # Draw ONLY recent map features (last 200 frames) to reduce rendering load
+        # spatial_grid is still kept in full for localization, just not all visualized
+        feature_age_limit = 200
         for feat in self.spatial_grid.values():
-            sx, sy = project(feat['x'], feat['y'])
-            if 0 <= sx < size and 0 <= sy < size:
-                brightness = int(np.clip(200.0 / (feat['z'] + 0.5), 40, 255))
-                cv2.circle(canvas, (sx, sy), 2, (brightness, brightness, brightness), -1)
-        
-        # ORANGE trajectory
-        if len(self.trajectory) > 1:
-            points = []
-            for (x, y, _) in self.trajectory:
+            if self.frame_count - feat['frame'] < feature_age_limit:
+                sx, sy = project(feat['x'], feat['y'])
+                if 0 <= sx < size and 0 <= sy < size:
+                    brightness = int(np.clip(200.0 / (feat['z'] + 0.5), 40, 255))
+                    cv2.circle(canvas, (sx, sy), 2, (brightness, brightness, brightness), -1)
+
+        # ORANGE trajectory: Connect ONLY keyframes (sparse waypoints)
+        if len(self.keyframe_trajectory) > 1:
+            kf_points = []
+            for (x, y, _) in self.keyframe_trajectory:
                 px, py = project(x, y)
                 if 0 <= px < size and 0 <= py < size:
-                    points.append((px, py))
-            
-            if len(points) > 1:
-                for i in range(len(points) - 1):
-                    cv2.line(canvas, points[i], points[i+1], (0, 165, 255), 3, cv2.LINE_AA)
+                    kf_points.append((px, py))
+
+            if len(kf_points) > 1:
+                for i in range(len(kf_points) - 1):
+                    cv2.line(canvas, kf_points[i], kf_points[i+1], (0, 165, 255), 3, cv2.LINE_AA)
         
         # Meter markers
         for marker in self.meter_markers:

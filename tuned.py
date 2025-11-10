@@ -1,6 +1,7 @@
 # ===============================================================================
 # TUNED SLAM: BALANCED KEYFRAME SELECTION (Not too sparse, not too dense)
 # ===============================================================================
+# Feature Detector: SIFT (Scale-Invariant Feature Transform)
 # Solution: Increase thresholds to reduce keyframe frequency
 # - Distance threshold: 0.1m → 0.3m (create KF every 30cm, not 10cm)
 # - Rotation threshold: 15° → 30° (create KF every 30°, not 15°)
@@ -260,22 +261,18 @@ class TunedFeatureTrackingSLAM:
         self.first_frame_initialized = False
         self.local_map_size = local_map_size
         
-        # Feature detection
+        # Feature detection - SIFT
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        self.orb = cv2.ORB_create(
+        self.sift = cv2.SIFT_create(
             nfeatures=300,
-            scaleFactor=1.2,
-            nlevels=8,
+            nOctaveLayers=3,
+            contrastThreshold=0.04,
             edgeThreshold=10,
-            firstLevel=0,
-            WTA_K=2,
-            scoreType=cv2.ORB_HARRIS_SCORE,
-            patchSize=31,
-            fastThreshold=10
+            sigma=1.6
         )
         self.total_distance_traveled = 0.0
         self.total_distance_at_last_keyframe = 0.0
-        self.bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        self.bf_matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
         
         # Depth processing
         self.lookahead_height_ratio = lookahead_height_ratio
@@ -315,27 +312,27 @@ class TunedFeatureTrackingSLAM:
     def feature_extraction(self, gray, depth_map):
         enhanced = self.clahe.apply(gray)
         enhanced = cv2.convertScaleAbs(enhanced, alpha=1.2, beta=5)
-        
+
         img_height, img_width = gray.shape
         mask = np.zeros_like(enhanced, dtype=np.uint8)
         h_start = int(img_height * 0.33)
         mask[h_start:, :] = 255
-        
-        kp_orb, desc_orb = self.orb.detectAndCompute(enhanced, mask=mask)
-        
-        if kp_orb is None or desc_orb is None or len(kp_orb) == 0:
+
+        kp_sift, desc_sift = self.sift.detectAndCompute(enhanced, mask=mask)
+
+        if kp_sift is None or desc_sift is None or len(kp_sift) == 0:
             return [], None
-        
-        kp_desc_pairs = list(zip(kp_orb, desc_orb))
+
+        kp_desc_pairs = list(zip(kp_sift, desc_sift))
         kp_desc_pairs.sort(key=lambda x: -x[0].response)
-        
+
         n_features = min(len(kp_desc_pairs), self.max_features_per_frame)
         kp_desc_pairs = kp_desc_pairs[:n_features]
-        
-        kp_orb = [kp for kp, _ in kp_desc_pairs]
-        desc_orb = np.array([desc for _, desc in kp_desc_pairs])
-        
-        return kp_orb, desc_orb
+
+        kp_sift = [kp for kp, _ in kp_desc_pairs]
+        desc_sift = np.array([desc for _, desc in kp_desc_pairs])
+
+        return kp_sift, desc_sift
     
     # ======== FEATURE TRACKING + COVERAGE CHECK ========
     def track_old_features(self, current_gray):
@@ -375,16 +372,16 @@ class TunedFeatureTrackingSLAM:
             return 0, 0.0
     
     # ======== FUNCTION 2: MAP BUILDING ========
-    def map_building(self, kp_orb, desc_orb, gray, depth_map, pose):
+    def map_building(self, kp_sift, desc_sift, gray, depth_map, pose):
         img_height, img_width = gray.shape
-        
+
         valid_depth_count = 0
         new_features = []
         all_features = []
         features_3d = []
         keypoints_2d = []
-        
-        for i, kp in enumerate(kp_orb):
+
+        for i, kp in enumerate(kp_sift):
             u, v = int(kp.pt[0]), int(kp.pt[1])
             
             if not (0 <= u < img_width and 0 <= v < img_height):
@@ -403,7 +400,7 @@ class TunedFeatureTrackingSLAM:
                 
                 if world_pos is not None:
                     x_world, y_world, z_cam = world_pos
-                    descriptor = desc_orb[i]
+                    descriptor = desc_sift[i]
                     quality = kp.response
                     
                     self._add_to_spatial_grid(x_world, y_world, metric_depth,
@@ -419,50 +416,50 @@ class TunedFeatureTrackingSLAM:
                     features_3d.append((x_world, y_world, z_cam))
                     keypoints_2d.append((u, v))
         
-        self.feature_counts['total'] = len(kp_orb)
+        self.feature_counts['total'] = len(kp_sift)
         self.feature_counts['valid_depth'] = valid_depth_count
         self.feature_counts['stored'] = len(self.keyframes_info)
-        
+
         self._update_visible_features()
         self.feature_counts['displayed'] = len(self.visible_map_points)
-        
+
         self.current_features = all_features
         self.visible_features = [(int(pt['u']), int(pt['v'])) for pt in self.visible_map_points]
-        
+
         self._adjust_feature_target()
-        self.prev_keypoints = kp_orb
-        self.prev_descriptors = desc_orb
-        
-        self.prev_keypoint_positions = [(kp.pt[0], kp.pt[1]) for kp in kp_orb]
+        self.prev_keypoints = kp_sift
+        self.prev_descriptors = desc_sift
+
+        self.prev_keypoint_positions = [(kp.pt[0], kp.pt[1]) for kp in kp_sift]
         
         return new_features, features_3d, keypoints_2d
     
     # ======== FUNCTION 3: LOCALIZATION ========
-    def localization_loop(self, gray, kp_orb, desc_orb):
+    def localization_loop(self, gray, kp_sift, desc_sift):
         if self.successfully_tracked_count < self.tracked_feature_threshold:
-            self._match_with_keyframes(desc_orb)
+            self._match_with_keyframes(desc_sift)
         else:
             self.matched_keyframe_id = None
             self.keyframe_match_confidence = 0.0
             self.matched_kf_position = None
     
-    def _match_with_keyframes(self, desc_orb):
-        if desc_orb is None or len(self.keyframes_info) == 0:
+    def _match_with_keyframes(self, desc_sift):
+        if desc_sift is None or len(self.keyframes_info) == 0:
             return
-        
+
         best_match_kf_id = None
         best_match_count = 0
         best_confidence = 0.0
         best_position = None
-        
+
         for kf_id_str, kf_info in self.keyframes_info.items():
             kf_id = int(kf_id_str)
             keyframe = self.storage_manager.load_keyframe(kf_id)
             if keyframe is None or keyframe.descriptors is None:
                 continue
-            
-            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-            matches = bf.knnMatch(desc_orb, keyframe.descriptors, k=2)
+
+            bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+            matches = bf.knnMatch(desc_sift, keyframe.descriptors, k=2)
             
             good_matches = []
             for match in matches:
@@ -529,7 +526,7 @@ class TunedFeatureTrackingSLAM:
         best_inliers = 0
         best_confidence = 0.0
 
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
 
         # Check ALL candidates (no spatial filtering!)
         for kf_id in candidate_kf_ids:
@@ -714,7 +711,7 @@ class TunedFeatureTrackingSLAM:
         else:
             return False
     
-    def _create_keyframe(self, gray, depth_map, kp_orb, desc_orb, features_3d, keypoints_2d):
+    def _create_keyframe(self, gray, depth_map, kp_sift, desc_sift, features_3d, keypoints_2d):
         if self.current_keyframe is not None:
             self.storage_manager.save_keyframe(self.current_keyframe)
             self.keyframes_info[str(self.current_keyframe.id)] = {
@@ -722,12 +719,12 @@ class TunedFeatureTrackingSLAM:
                 'num_features': len(self.current_keyframe.features_3d),
                 'timestamp': self.current_keyframe.timestamp
             }
-        
+
         keyframe = KeyFrame(
             frame_id=self.keyframe_counter,
             pose=self.pose,
             features_3d=features_3d,
-            descriptors=desc_orb,
+            descriptors=desc_sift,
             keypoints_2d=keypoints_2d,
             fx=self.fx, fy=self.fy, cx=self.cx, cy=self.cy,
             depth_scale=DEPTH_SCALE,
@@ -748,10 +745,10 @@ class TunedFeatureTrackingSLAM:
 
         return keyframe
     
-    def _initialize_first_frame(self, gray, depth_map, kp_orb, desc_orb, features_3d, keypoints_2d):
+    def _initialize_first_frame(self, gray, depth_map, kp_sift, desc_sift, features_3d, keypoints_2d):
         if not self.first_frame_initialized:
             print("\n🔷 INITIALIZING FIRST FRAME AS REFERENCE")
-            self._create_keyframe(gray, depth_map, kp_orb, desc_orb, features_3d, keypoints_2d)
+            self._create_keyframe(gray, depth_map, kp_sift, desc_sift, features_3d, keypoints_2d)
             self.first_frame_initialized = True
             print("✅ First keyframe created\n")
     
@@ -854,21 +851,21 @@ class TunedFeatureTrackingSLAM:
         # FEATURE TRACKING
         if self.prev_gray is not None:
             self.track_old_features(gray)
-        
+
         # PARALLEL PROCESSING
-        kp_orb, desc_orb = self.feature_extraction(gray, depth_map)
+        kp_sift, desc_sift = self.feature_extraction(gray, depth_map)
         new_features, features_3d, keypoints_2d = self.map_building(
-            kp_orb, desc_orb, gray, depth_map, self.pose
+            kp_sift, desc_sift, gray, depth_map, self.pose
         )
         _, coverage = self.track_old_features(gray) if self.prev_gray is not None else (0, 0.0)
-        
-        self.localization_loop(gray, kp_orb, desc_orb)
-        
+
+        self.localization_loop(gray, kp_sift, desc_sift)
+
         # KEYFRAME MANAGEMENT
         if not self.first_frame_initialized:
-            self._initialize_first_frame(gray, depth_map, kp_orb, desc_orb, features_3d, keypoints_2d)
+            self._initialize_first_frame(gray, depth_map, kp_sift, desc_sift, features_3d, keypoints_2d)
         elif self._should_create_keyframe(coverage):
-            self._create_keyframe(gray, depth_map, kp_orb, desc_orb, features_3d, keypoints_2d)
+            self._create_keyframe(gray, depth_map, kp_sift, desc_sift, features_3d, keypoints_2d)
             # Check for loop closure after creating keyframe
             self.loop_closure_and_bundle_adjustment()
         

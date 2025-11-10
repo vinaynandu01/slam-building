@@ -18,6 +18,8 @@ import pickle
 import requests
 from collections import defaultdict, deque
 import json
+from concurrent.futures import ThreadPoolExecutor
+import threading
 
 # =============== Configuration ===============
 try:
@@ -213,21 +215,23 @@ class TunedFeatureTrackingSLAM:
         
         # Motion
         self.motion_mode = "REST"
-        self.FIXED_FORWARD_DISTANCE = 0.004
+        self.FIXED_FORWARD_DISTANCE = 0.008
         self.ROTATION_SENSITIVITY = rotation_sensitivity
         self.rest_frames_count = 0
         self.rest_frames_threshold = 10
         
-        # Features
+        # Features (minimal RAM usage - only for current processing)
         self.min_features_per_frame = min_features_per_frame
         self.max_features_per_frame = max_features_per_frame
         self.current_feature_target = max_features_per_frame
         self.spatial_grid_size = spatial_grid_size
-        self.spatial_grid = {}
-        self.max_map_features = 15000
         self.feature_lifetime_frames = feature_lifetime_frames
         self.visible_map_points = []
         self.max_depth_threshold = max_depth_threshold
+
+        # Multi-threading
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        self.lock = threading.Lock()
         
         # ============ TUNED KEYFRAME THRESHOLDS ============
         self.tracked_feature_threshold = tracked_feature_threshold      # ✅ 20
@@ -240,11 +244,12 @@ class TunedFeatureTrackingSLAM:
         # Feature tracking
         self.successfully_tracked_count = 0
         
-        # Loop closure
-        self.loop_closure_history = []
-        self.loop_closure_threshold = 0.90
-        self.loop_closure_cooldown = 0
-        self.loop_closure_cooldown_frames = 100
+        # Loop closure - every 5th keyframe
+        self.loop_closure_enabled = True
+        self.loop_closure_check_interval = 5  # Check every 5th keyframe
+        self.loop_closure_min_inliers = 6
+        self.loop_closure_matches = []
+        self.last_loop_closure_kf = -1
         
         # Keyframe management
         self.storage_manager = KeyframeStorageManager()
@@ -258,7 +263,7 @@ class TunedFeatureTrackingSLAM:
         # Feature detection
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         self.orb = cv2.ORB_create(
-            nfeatures=500,
+            nfeatures=300,
             scaleFactor=1.2,
             nlevels=8,
             edgeThreshold=10,
@@ -268,7 +273,8 @@ class TunedFeatureTrackingSLAM:
             patchSize=31,
             fastThreshold=10
         )
-        
+        self.total_distance_traveled = 0.0
+        self.total_distance_at_last_keyframe = 0.0
         self.bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         
         # Depth processing
@@ -415,7 +421,7 @@ class TunedFeatureTrackingSLAM:
         
         self.feature_counts['total'] = len(kp_orb)
         self.feature_counts['valid_depth'] = valid_depth_count
-        self.feature_counts['stored'] = len(self.spatial_grid)
+        self.feature_counts['stored'] = len(self.keyframes_info)
         
         self._update_visible_features()
         self.feature_counts['displayed'] = len(self.visible_map_points)
@@ -480,62 +486,154 @@ class TunedFeatureTrackingSLAM:
         if best_match_kf_id is not None:
             print(f"🎯 Matched with KF#{best_match_kf_id} (conf: {best_confidence*100:.1f}%)")
     
-    # ======== FUNCTION 4: LOOP CLOSURE ========
-    def loop_closure_and_bundle_adjustment(self, depth_pattern):
-        if self._check_loop_closure(depth_pattern):
-            print("🔄 LOOP CLOSURE DETECTED")
+    # ======== FUNCTION 4: LOOP CLOSURE WITH POSE CORRECTION ========
+    def loop_closure_and_bundle_adjustment(self):
+        """Check loop closure after EVERY keyframe"""
+        if not self.loop_closure_enabled:
+            return
+
+        if len(self.keyframes_info) < 3:
+            return
+
+        print(f"\n🔍 Loop closure check for KF#{self.keyframe_counter-1}...")
         
-        if depth_pattern is not None:
-            self.loop_closure_history.append((self.frame_count, depth_pattern))
-            if len(self.loop_closure_history) > 50:
-                self.loop_closure_history.pop(0)
+        matched_kf_id, confidence, inliers = self._detect_loop_closure()
+
+        if matched_kf_id is not None and inliers >= self.loop_closure_min_inliers:
+            print(f"🔄 LOOP CLOSURE! Matched KF#{matched_kf_id} (inliers={inliers}, conf={confidence*100:.1f}%)")
+            self._correct_pose_on_loop_closure(matched_kf_id)
+            self.loop_closure_matches.append({
+                'current_kf': self.keyframe_counter - 1,
+                'matched_kf': matched_kf_id,
+                'inliers': inliers
+            })
+        else:
+            print(f"   No loop closure")
     
-    def _check_loop_closure(self, current_pattern):
-        if self.loop_closure_cooldown > 0:
-            self.loop_closure_cooldown -= 1
-            return False
-        
-        if current_pattern is None or len(self.loop_closure_history) < 5:
-            return False
-        
-        min_frame_gap = 100
-        current_frame = self.frame_count
-        
-        for past_frame, past_pattern in self.loop_closure_history[-20:]:
-            if current_frame - past_frame < min_frame_gap:
+    def _detect_loop_closure(self):
+        """Match current keyframe against ALL previous keyframes - NO spatial filter"""
+        if self.current_keyframe is None or self.current_keyframe.descriptors is None:
+            return None, 0, 0
+
+        current_desc = np.array(self.current_keyframe.descriptors, dtype=np.uint8)
+        current_kf_id = self.current_keyframe.id
+
+        # Get ALL previous keyframes (only skip very recent - gap of 10)
+        all_kf_ids = sorted([int(k) for k in self.keyframes_info.keys()])
+        candidate_kf_ids = [kf_id for kf_id in all_kf_ids if kf_id < current_kf_id - 10]
+
+        if len(candidate_kf_ids) == 0:
+            return None, 0, 0
+
+        best_match_kf_id = None
+        best_inliers = 0
+        best_confidence = 0.0
+
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
+        # Check ALL candidates (no spatial filtering!)
+        for kf_id in candidate_kf_ids:
+            kf = self.storage_manager.load_keyframe(kf_id)
+            if kf is None or kf.descriptors is None:
                 continue
-            
-            if len(current_pattern) == len(past_pattern):
-                similarity = np.corrcoef(current_pattern, past_pattern)[0, 1]
-                if not np.isnan(similarity) and similarity > self.loop_closure_threshold:
-                    self.loop_closure_cooldown = self.loop_closure_cooldown_frames
-                    return True
-        
-        return False
+
+            try:
+                kf_descriptors = np.array(kf.descriptors, dtype=np.uint8)
+                matches = bf.knnMatch(current_desc, kf_descriptors, k=2)
+            except cv2.error:
+                continue
+
+            # Lowe's ratio test
+            good_matches = []
+            for m_n in matches:
+                if len(m_n) == 2:
+                    m, n = m_n
+                    if m.distance < 0.75 * n.distance:
+                        good_matches.append(m)
+
+            if len(good_matches) < 10:
+                continue
+
+            # Build 3D-2D correspondences
+            object_points = []
+            image_points = []
+
+            for match in good_matches:
+                kf_feat_idx = match.trainIdx
+                curr_feat_idx = match.queryIdx
+
+                if kf_feat_idx < len(kf.features_3d) and curr_feat_idx < len(self.current_keyframe.keypoints_2d):
+                    x_world, y_world, z_world = kf.features_3d[kf_feat_idx]
+                    u, v = self.current_keyframe.keypoints_2d[curr_feat_idx]
+                    object_points.append([x_world, y_world, z_world])
+                    image_points.append([u, v])
+
+            if len(object_points) < 10:
+                continue
+
+            object_points = np.array(object_points, dtype=np.float32)
+            image_points = np.array(image_points, dtype=np.float32)
+
+            # PnP RANSAC - same as local.py
+            success, rvec, tvec, inliers = cv2.solvePnPRansac(
+                object_points, image_points, self.K, None,
+                iterationsCount=100,
+                reprojectionError=8.0,
+                confidence=0.99
+            )
+
+            if success and inliers is not None:
+                inlier_count = len(inliers)
+                confidence = len(good_matches) / (len(kf.descriptors) + 1e-6)
+                
+                print(f"   KF#{kf_id}: {inlier_count} inliers, conf={confidence*100:.1f}%")
+                
+                if inlier_count > best_inliers:
+                    best_inliers = inlier_count
+                    best_match_kf_id = kf_id
+                    best_confidence = confidence
+
+        return best_match_kf_id, best_confidence, best_inliers
+    
+    def _correct_pose_on_loop_closure(self, matched_kf_id):
+        """Correct current pose to align with matched keyframe"""
+        matched_kf = self.storage_manager.load_keyframe(matched_kf_id)
+        if matched_kf is None:
+            return
+
+        # Calculate pose correction
+        # Simple approach: Update current pose to be close to matched keyframe
+        matched_pose = matched_kf.pose
+
+        # Calculate drift between current pose and where we should be
+        dx = self.pose[0] - matched_pose[0]
+        dy = self.pose[1] - matched_pose[1]
+
+        drift_distance = math.sqrt(dx**2 + dy**2)
+
+        print(f"   Drift detected: {drift_distance:.3f}m")
+        print(f"   Correcting pose: ({self.pose[0]:.3f}, {self.pose[1]:.3f}) → ({matched_pose[0]:.3f}, {matched_pose[1]:.3f})")
+
+        # Apply correction - snap to matched keyframe location
+        self.pose[0] = matched_pose[0]
+        self.pose[1] = matched_pose[1]
+        self.pose[2] = matched_pose[2]
+
+        # Update last keyframe reference
+        self.pose_at_last_keyframe = self.pose.copy()
+
+        # Update trajectory to show loop closure
+        if len(self.keyframe_trajectory) > 0:
+            self.keyframe_trajectory[-1] = self.pose.copy()
     
     # ======== Helper Methods ========
     def _spatial_grid_key(self, x, y):
         return (int(x / self.spatial_grid_size), int(y / self.spatial_grid_size))
     
     def _add_to_spatial_grid(self, x, y, z, descriptor, quality, frame):
-        key = self._spatial_grid_key(x, y)
-        if key in self.spatial_grid:
-            existing = self.spatial_grid[key]
-            if quality > existing['quality']:
-                self.spatial_grid[key] = {
-                    'x': x, 'y': y, 'z': z,
-                    'descriptor': descriptor,
-                    'quality': quality,
-                    'frame': frame
-                }
-        else:
-            if len(self.spatial_grid) < self.max_map_features:
-                self.spatial_grid[key] = {
-                    'x': x, 'y': y, 'z': z,
-                    'descriptor': descriptor,
-                    'quality': quality,
-                    'frame': frame
-                }
+        # Features are stored in keyframes on disk, not in RAM
+        # This method kept for backward compatibility but does minimal work
+        pass
     
     def _midas_to_metric_depth(self, midas_value):
         if midas_value < 1e-3:
@@ -557,26 +655,6 @@ class TunedFeatureTrackingSLAM:
         y_world = pose[1] + (s * Z_cam - c * X_cam)
         
         return (x_world, y_world, Z_cam)
-    
-    def _extract_depth_pattern(self, depth_map, keypoints):
-        if depth_map is None or len(keypoints) < 10:
-            return None
-        
-        depths = []
-        for kp in keypoints[:20]:
-            u, v = int(kp.pt[0]), int(kp.pt[1])
-            if 0 <= v < depth_map.shape[0] and 0 <= u < depth_map.shape[1]:
-                midas_depth = depth_map[v, u]
-                metric_depth = self._midas_to_metric_depth(midas_depth)
-                if metric_depth is not None and metric_depth <= self.max_depth_threshold:
-                    depths.append(metric_depth)
-        
-        if len(depths) < 5:
-            return None
-        
-        depths = np.array(depths)
-        pattern = depths / (np.max(depths) + 1e-6)
-        return pattern
     
     def _adjust_feature_target(self):
         if len(self.current_features) < self.min_features_per_frame:
@@ -627,51 +705,13 @@ class TunedFeatureTrackingSLAM:
     
     # ======== MULTI-CRITERIA KEYFRAME DECISION ========
     def _should_create_keyframe(self, coverage):
-        """
-        Create keyframe if ANY criteria met AND cooldown elapsed
-        """
+        """Create keyframe every 0.5m traveled - STRICT COOLDOWN"""
+        distance_traveled = self.total_distance_traveled - self.total_distance_at_last_keyframe
         
-        # Increment cooldown counter
-        self.frames_since_last_keyframe += 1
-        
-        # Check if in cooldown period
-        if self.frames_since_last_keyframe < self.keyframe_cooldown:
-            self.keyframe_cooldown_reason = f"Cooldown ({self.frames_since_last_keyframe}/{self.keyframe_cooldown} frames)"
-            return False
-        
-        reasons = []
-        
-        # Criterion 1: Feature tracking
-        if self.successfully_tracked_count < self.tracked_feature_threshold:
-            reasons.append(f"Tracked {self.successfully_tracked_count} < {self.tracked_feature_threshold}")
-        
-        # Criterion 2: Distance traveled
-        dist_since_kf = math.sqrt(
-            (self.pose[0] - self.pose_at_last_keyframe[0])**2 + 
-            (self.pose[1] - self.pose_at_last_keyframe[1])**2
-        )
-        if dist_since_kf > self.distance_threshold:
-            reasons.append(f"Distance {dist_since_kf:.3f}m > {self.distance_threshold:.3f}m")
-        
-        # Criterion 3: Rotation
-        rot_since_kf = abs(self.pose[2] - self.pose_at_last_keyframe[2])
-        if rot_since_kf > math.pi:
-            rot_since_kf = 2*math.pi - rot_since_kf
-        
-        if rot_since_kf > self.rotation_threshold:
-            reasons.append(f"Rotation {math.degrees(rot_since_kf):.1f}° > {math.degrees(self.rotation_threshold):.1f}°")
-        
-        # Criterion 4: Feature coverage
-        if coverage < self.feature_coverage_threshold:
-            reasons.append(f"Coverage {coverage*100:.1f}% < {self.feature_coverage_threshold*100:.1f}%")
-        
-        if reasons:
-            self.last_keyframe_trigger_reason = " | ".join(reasons)
-            self.keyframe_cooldown_reason = ""
+        if distance_traveled >= 0.2:
+            self.last_keyframe_trigger_reason = f"Distance {distance_traveled:.3f}m >= 0.2m"
             return True
         else:
-            self.last_keyframe_trigger_reason = ""
-            self.keyframe_cooldown_reason = ""
             return False
     
     def _create_keyframe(self, gray, depth_map, kp_orb, desc_orb, features_3d, keypoints_2d):
@@ -697,6 +737,7 @@ class TunedFeatureTrackingSLAM:
         self.prev_keyframe = self.current_keyframe
         self.current_keyframe = keyframe
         self.pose_at_last_keyframe = self.pose.copy()
+        self.total_distance_at_last_keyframe = self.total_distance_traveled
         self.keyframe_counter += 1
         self.frames_since_last_keyframe = 0  # Reset cooldown
 
@@ -794,6 +835,7 @@ class TunedFeatureTrackingSLAM:
                 
                 old_dist = self.path_distance
                 self.path_distance += trans_step
+                self.total_distance_traveled += trans_step
                 
                 if int(self.path_distance) > int(old_dist):
                     self.meter_markers.append({
@@ -821,14 +863,14 @@ class TunedFeatureTrackingSLAM:
         _, coverage = self.track_old_features(gray) if self.prev_gray is not None else (0, 0.0)
         
         self.localization_loop(gray, kp_orb, desc_orb)
-        depth_pattern = self._extract_depth_pattern(depth_map, kp_orb)
-        self.loop_closure_and_bundle_adjustment(depth_pattern)
         
         # KEYFRAME MANAGEMENT
         if not self.first_frame_initialized:
             self._initialize_first_frame(gray, depth_map, kp_orb, desc_orb, features_3d, keypoints_2d)
         elif self._should_create_keyframe(coverage):
             self._create_keyframe(gray, depth_map, kp_orb, desc_orb, features_3d, keypoints_2d)
+            # Check for loop closure after creating keyframe
+            self.loop_closure_and_bundle_adjustment()
         
         self.prev_gray = gray
     
@@ -875,14 +917,10 @@ class TunedFeatureTrackingSLAM:
         cv2.putText(vis, f"Dist: {dist_since_kf:.3f}m | Rot: {math.degrees(rot_since_kf):.1f}°", 
                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 200, 255), 2)
         y += 25
-        
-        cv2.putText(vis, f"Map: {self.feature_counts['stored']}/{self.max_map_features}",
-                   (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        
-        y += 25
+
         cv2.putText(vis, f"Keyframes: {len(self.keyframes_info) + (1 if self.current_keyframe else 0)}",
                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        
+
         y += 25
         if self.matched_keyframe_id is not None:
             cv2.putText(vis, f"🎯 Matched KF#{self.matched_keyframe_id}",
@@ -928,15 +966,7 @@ class TunedFeatureTrackingSLAM:
             sy = int(cam_screen_y - dy * scale)
             return sx, sy
         
-        # Draw ONLY recent map features (last 200 frames) to reduce rendering load
-        # spatial_grid is still kept in full for localization, just not all visualized
-        feature_age_limit = 200
-        for feat in self.spatial_grid.values():
-            if self.frame_count - feat['frame'] < feature_age_limit:
-                sx, sy = project(feat['x'], feat['y'])
-                if 0 <= sx < size and 0 <= sy < size:
-                    brightness = int(np.clip(200.0 / (feat['z'] + 0.5), 40, 255))
-                    cv2.circle(canvas, (sx, sy), 2, (brightness, brightness, brightness), -1)
+        # NO FEATURE POINTS DRAWN - Only keyframes shown as blue lines below
 
         # ORANGE trajectory: Connect ONLY keyframes (sparse waypoints)
         if len(self.keyframe_trajectory) > 1:
@@ -1032,8 +1062,8 @@ class TunedFeatureTrackingSLAM:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         
         y += 30
-        cv2.putText(canvas, f"Points: {len(self.spatial_grid)}", (10, y),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+        cv2.putText(canvas, f"Loop Closures: {len(self.loop_closure_matches)}", (10, y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         
         y += 30
         total_kfs = len(self.keyframes_info) + (1 if self.current_keyframe else 0)
@@ -1093,6 +1123,8 @@ class TunedFeatureTrackingSLAM:
         print(f"   + Minimum {self.keyframe_cooldown} frames between keyframes")
         print(f"✅ Storage: Only current KF in RAM, rest on disk")
         print(f"✅ Depth: Every 2nd frame")
+        print(f"✅ Loop Closure: Every {self.loop_closure_check_interval}th keyframe (multi-threaded)")
+        print(f"✅ Multi-threading: 4 CPU cores")
         print("\n⌨️ [ESC] Quit | [S] Save map | [P] Print stats | [+/-] Adjust cooldown")
         print("="*110 + "\n")
         
@@ -1146,7 +1178,10 @@ class TunedFeatureTrackingSLAM:
         
         cap.release()
         cv2.destroyAllWindows()
-        
+
+        # Shutdown thread pool
+        self.executor.shutdown(wait=True)
+
         print("\n💾 Finalizing...")
         if self.current_keyframe is not None:
             self.storage_manager.save_keyframe(self.current_keyframe)
@@ -1161,8 +1196,13 @@ class TunedFeatureTrackingSLAM:
         cv2.imwrite(f"slam_final_{timestamp}.png", final_map)
         
         print(f"✅ Total keyframes: {len(self.keyframes_info)}")
-        print(f"✅ Total map points: {len(self.spatial_grid)}")
+        print(f"✅ Loop closures detected: {len(self.loop_closure_matches)}")
         print(f"✅ Total distance: {self.path_distance:.2f}m")
+
+        if len(self.loop_closure_matches) > 0:
+            print("\n🔄 Loop Closure Summary:")
+            for lc in self.loop_closure_matches:
+                print(f"   KF#{lc['current_kf']} matched KF#{lc['matched_kf']} ({lc['inliers']} inliers)")
 
 # =============== MAIN ===============
 def main_menu():

@@ -291,7 +291,7 @@ class KeyFrame:
     def from_dict(data):
         descriptors = None
         if data.get('descriptors') is not None:
-            descriptors = np.array(data['descriptors'], dtype=np.uint8)
+            descriptors = np.array(data['descriptors'], dtype=np.float32)
 
         kf = KeyFrame(
             frame_id=data['id'],
@@ -364,7 +364,13 @@ class RoverNavigation:
         self.goal_keyframe = None
 
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        self.orb = cv2.ORB_create(nfeatures=500)
+        self.sift = cv2.SIFT_create(
+            nfeatures=300,
+            nOctaveLayers=3,
+            contrastThreshold=0.04,
+            edgeThreshold=10,
+            sigma=1.6
+        )
 
         # NEW: Depth utilities
         self.depth_estimator = DepthEstimator()
@@ -395,20 +401,27 @@ class RoverNavigation:
         return True
 
     def feature_extraction(self, gray: np.ndarray) -> Tuple[List, Optional[np.ndarray]]:
-        """Extract ORB features from grayscale frame"""
+        """Extract SIFT features from grayscale frame"""
         enhanced = self.clahe.apply(gray)
         enhanced = cv2.convertScaleAbs(enhanced, alpha=1.2, beta=5)
-        kp, desc = self.orb.detectAndCompute(enhanced, None)
+
+        # Create mask to focus on lower 2/3 of image
+        img_height, img_width = gray.shape
+        mask = np.zeros_like(enhanced, dtype=np.uint8)
+        h_start = int(img_height * 0.33)
+        mask[h_start:, :] = 255
+
+        kp, desc = self.sift.detectAndCompute(enhanced, mask=mask)
 
         if kp is None or desc is None or len(kp) == 0:
             return [], None
 
         pairs = list(zip(kp, desc))
         pairs.sort(key=lambda x: -x[0].response)
-        top = pairs[:min(len(pairs), 500)]
+        top = pairs[:min(len(pairs), 300)]
 
         kp = [p[0] for p in top]
-        desc = np.array([p[1] for p in top], dtype=np.uint8)
+        desc = np.array([p[1] for p in top])
 
         return kp, desc
 
@@ -471,8 +484,8 @@ class RoverNavigation:
         if not candidates:
             return None, 0, 0
 
-        # Matcher
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        # Matcher - NORM_L2 for SIFT descriptors
+        bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
         matches_info = []
 
         for kf_id in candidates:
@@ -481,9 +494,9 @@ class RoverNavigation:
                 continue
 
             try:
-                kf_desc = np.array(kf.descriptors, dtype=np.uint8)
-                desc_curr_uint8 = np.array(desc_curr, dtype=np.uint8)
-                matches = bf.knnMatch(desc_curr_uint8, kf_desc, k=2)
+                kf_desc = np.array(kf.descriptors, dtype=np.float32)
+                desc_curr_float32 = np.array(desc_curr, dtype=np.float32)
+                matches = bf.knnMatch(desc_curr_float32, kf_desc, k=2)
             except cv2.error:
                 continue
 

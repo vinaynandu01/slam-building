@@ -115,7 +115,7 @@ class KeyFrame:
     def from_dict(data):
         descriptors = None
         if data['descriptors'] is not None:
-            descriptors = np.array(data['descriptors'], dtype=np.uint8)
+            descriptors = np.array(data['descriptors'], dtype=np.float32)
         kf = KeyFrame(
             frame_id=data['id'],
             pose=np.array(data['pose']),
@@ -259,8 +259,8 @@ class HybridSLAM:
         self.local_map_size = local_map_size
 
         # Feature extraction and tracking
-        self.sift = cv2.SIFT_create()
-        self.flann = cv2.FlannBasedMatcher(dict(algorithm=6, table_number=12, key_size=20),
+        self.surf = cv2.xfeatures2d.SURF_create(400)
+        self.flann = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5),
                                           dict(checks=50))
         self.prev_gray = None
         self.current_features = []
@@ -270,10 +270,10 @@ class HybridSLAM:
     def feature_extraction(self, gray, depth_map):
         """Extract features from image"""
         try:
-            kp, des = self.sift.detectAndCompute(gray, None)
+            kp, des = self.surf.detectAndCompute(gray, None)
             if des is None:
                 return [], None
-            des = np.array(des, dtype=np.uint8)
+            des = np.array(des, dtype=np.float32)
             return kp, des
         except Exception as e:
             print(f"❌ Feature extraction error: {e}")
@@ -485,8 +485,8 @@ class HybridSLAM:
 
                         if prev_des is not None:
                             try:
-                                des = np.array(des, dtype=np.uint8)
-                                prev_des = np.array(prev_des, dtype=np.uint8)
+                                des = np.array(des, dtype=np.float32)
+                                prev_des = np.array(prev_des, dtype=np.float32)
                                 matches = self.flann.knnMatch(prev_des, des, k=2)
 
                                 good_matches = []
@@ -698,10 +698,10 @@ class HybridSLAM:
                 continue
 
             try:
-                kf_descriptors = np.array(keyframe.descriptors, dtype=np.uint8)
-                desc_test_uint8 = np.array(desc_test, dtype=np.uint8)
+                kf_descriptors = np.array(keyframe.descriptors, dtype=np.float32)
+                desc_test_float32 = np.array(desc_test, dtype=np.float32)
 
-                matches = self.flann.knnMatch(kf_descriptors, desc_test_uint8, k=2)
+                matches = self.flann.knnMatch(kf_descriptors, desc_test_float32, k=2)
 
                 good_matches = []
                 for match_pair in matches:

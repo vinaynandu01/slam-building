@@ -262,7 +262,7 @@ class TunedFeatureTrackingSLAM:
         # Loop closure - every 5th keyframe
         self.loop_closure_enabled = True
         self.loop_closure_check_interval = 5  # Check every 5th keyframe
-        self.loop_closure_min_inliers = 6
+        self.loop_closure_min_inliers = 5  # Lowered for better SIFT matching
         self.loop_closure_matches = []
         self.last_loop_closure_kf = -1
         
@@ -474,12 +474,13 @@ class TunedFeatureTrackingSLAM:
 
             bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
             matches = bf.knnMatch(desc_sift, keyframe.descriptors, k=2)
-            
+
             good_matches = []
             for match in matches:
                 if len(match) == 2:
                     m, n = match
-                    if m.distance < 0.75 * n.distance:
+                    # Use same ratio as loop closure (0.8 for SIFT)
+                    if m.distance < 0.8 * n.distance:
                         good_matches.append(m)
             
             match_confidence = len(good_matches) / (len(keyframe.descriptors) + 1e-6)
@@ -526,7 +527,8 @@ class TunedFeatureTrackingSLAM:
         if self.current_keyframe is None or self.current_keyframe.descriptors is None:
             return None, 0, 0
 
-        current_desc = np.array(self.current_keyframe.descriptors, dtype=np.uint8)
+        # SIFT descriptors are float32, not uint8!
+        current_desc = np.array(self.current_keyframe.descriptors, dtype=np.float32)
         current_kf_id = self.current_keyframe.id
 
         # Get ALL previous keyframes (only skip very recent - gap of 10)
@@ -549,20 +551,22 @@ class TunedFeatureTrackingSLAM:
                 continue
 
             try:
-                kf_descriptors = np.array(kf.descriptors, dtype=np.uint8)
+                # SIFT descriptors must be float32
+                kf_descriptors = np.array(kf.descriptors, dtype=np.float32)
                 matches = bf.knnMatch(current_desc, kf_descriptors, k=2)
             except cv2.error:
                 continue
 
-            # Lowe's ratio test
+            # Lowe's ratio test - more lenient for SIFT (0.8 instead of 0.75)
             good_matches = []
             for m_n in matches:
                 if len(m_n) == 2:
                     m, n = m_n
-                    if m.distance < 0.75 * n.distance:
+                    if m.distance < 0.8 * n.distance:  # More lenient ratio
                         good_matches.append(m)
 
-            if len(good_matches) < 10:
+            # Lower threshold for SIFT matching
+            if len(good_matches) < 8:
                 continue
 
             # Build 3D-2D correspondences
@@ -579,18 +583,19 @@ class TunedFeatureTrackingSLAM:
                     object_points.append([x_world, y_world, z_world])
                     image_points.append([u, v])
 
-            if len(object_points) < 10:
+            if len(object_points) < 8:
                 continue
 
             object_points = np.array(object_points, dtype=np.float32)
             image_points = np.array(image_points, dtype=np.float32)
 
-            # PnP RANSAC - same as local.py
+            # PnP RANSAC - optimized for SIFT
             success, rvec, tvec, inliers = cv2.solvePnPRansac(
                 object_points, image_points, self.K, None,
-                iterationsCount=100,
-                reprojectionError=8.0,
-                confidence=0.99
+                iterationsCount=200,          # More iterations for robustness
+                reprojectionError=12.0,       # More lenient (was 8.0)
+                confidence=0.99,
+                flags=cv2.SOLVEPNP_ITERATIVE  # Better for SIFT features
             )
 
             if success and inliers is not None:

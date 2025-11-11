@@ -22,6 +22,18 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
+# =============== Google Colab Detection & Display Setup ===============
+try:
+    import google.colab
+    IN_COLAB = True
+    from google.colab.patches import cv2_imshow
+    from IPython import display
+    from PIL import Image
+    print("🌐 Running in Google Colab - Using IPython display")
+except ImportError:
+    IN_COLAB = False
+    print("💻 Running locally - Using cv2.imshow")
+
 # =============== Configuration ===============
 try:
     DEPTH_SCALE = np.load("depth_scale_factor.npy").item()
@@ -217,7 +229,9 @@ class TunedFeatureTrackingSLAM:
         # Motion
         self.motion_mode = "REST"
         self.FIXED_FORWARD_DISTANCE = 0.008
-        self.ROTATION_SENSITIVITY = rotation_sensitivity
+        self.BASE_ROTATION_SENSITIVITY = rotation_sensitivity  # Base sensitivity
+        self.ROTATION_SENSITIVITY = rotation_sensitivity  # Will be adjusted dynamically
+        self.BASE_FPS = 15.0  # Reference FPS for rotation sensitivity calibration
         self.rest_frames_count = 0
         self.rest_frames_threshold = 10
         
@@ -764,7 +778,16 @@ class TunedFeatureTrackingSLAM:
                 align_corners=False
             ).squeeze()
         return pred.cpu().numpy()
-    
+
+    def adjust_rotation_sensitivity(self, current_fps):
+        """Dynamically adjust rotation sensitivity based on FPS
+
+        If FPS increases, rotation sensitivity should increase proportionally
+        to maintain consistent rotation behavior
+        """
+        if current_fps > 0:
+            self.ROTATION_SENSITIVITY = self.BASE_ROTATION_SENSITIVITY * (current_fps / self.BASE_FPS)
+
     def update(self, gray, frame_bgr):
         img_height, img_width = gray.shape
         self.frame_count += 1
@@ -1099,19 +1122,20 @@ class TunedFeatureTrackingSLAM:
         return canvas
     
     def run_slam(self, source=0, target_w=640, target_h=480,
-                 use_rover_stream=False, rover_url=None):
+                 use_rover_stream=False, rover_url=None, max_frames=None):
         if use_rover_stream and rover_url:
             cap = RoverStreamCapture(rover_url)
         else:
             cap = cv2.VideoCapture(source)
-        
+
         if not cap.isOpened():
             print("❌ Cannot open video source")
             return
-        
+
         print("\n" + "="*110)
-        print("🎯 TUNED SLAM - BALANCED KEYFRAME SELECTION")
+        print("🎯 TUNED SLAM - BALANCED KEYFRAME SELECTION (SIFT)")
         print("="*110)
+        print(f"✅ Environment: {'Google Colab (GPU)' if IN_COLAB else 'Local'}")
         print(f"✅ Keyframe triggers (ANY met + cooldown):")
         print(f"   1. Tracked features < {self.tracked_feature_threshold}")
         print(f"   2. Distance traveled > {self.distance_threshold:.3f}m (30cm)")
@@ -1122,59 +1146,94 @@ class TunedFeatureTrackingSLAM:
         print(f"✅ Depth: Every 2nd frame")
         print(f"✅ Loop Closure: Every {self.loop_closure_check_interval}th keyframe (multi-threaded)")
         print(f"✅ Multi-threading: 4 CPU cores")
-        print("\n⌨️ [ESC] Quit | [S] Save map | [P] Print stats | [+/-] Adjust cooldown")
+        print(f"✅ Dynamic Rotation Sensitivity: Base {self.BASE_ROTATION_SENSITIVITY} @ {self.BASE_FPS}fps")
+        if IN_COLAB:
+            print(f"\n📱 Colab Mode: Live map display every 30 frames")
+            print(f"   Set max_frames parameter to limit processing (None = process entire video)")
+        else:
+            print("\n⌨️ [ESC] Quit | [S] Save map | [P] Print stats | [+/-] Adjust cooldown")
         print("="*110 + "\n")
-        
+
         fps = 0.0
         prev_time = time.time()
-        
+        frame_counter = 0
+
+        # Colab display setup
+        if IN_COLAB:
+            display_handle = display.display(display_id=True)
+
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            
+
+            frame_counter += 1
+            if max_frames and frame_counter > max_frames:
+                print(f"\n⏹️ Reached max_frames limit: {max_frames}")
+                break
+
             frame = cv2.resize(frame, (target_w, target_h))
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            
+
             self.update(gray, frame)
-            
+
             now = time.time()
             dt = now - prev_time
             prev_time = now
-            
+
             if dt > 0:
                 fps = 0.85 * fps + 0.15 * (1.0 / dt) if fps > 0 else 1.0 / dt
-            
-            vis = self.draw_camera_view(frame, self.prev_depth)
-            cv2.imshow("Camera View - Tuned Keyframes", vis)
-            
-            top_map = self.draw_top_view(scale=100, size=900, fps=fps)
-            cv2.imshow("Top View - Balanced Keyframe Density", top_map)
-            
-            key = cv2.waitKey(1) & 0xFF
-            if key == 27:
-                break
-            elif key == ord('s') or key == ord('S'):
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                map_img = self.draw_top_view(scale=100, size=900, fps=None)
-                map_filename = f"slam_tuned_{timestamp}.png"
-                cv2.imwrite(map_filename, map_img)
-                print(f"✅ Saved: {map_filename}")
-            elif key == ord('p') or key == ord('P'):
-                print(f"\n📊 STATISTICS:")
-                print(f"   Frame: {self.frame_count}")
-                print(f"   Distance: {self.path_distance:.3f}m")
-                print(f"   Keyframes (stored): {len(self.keyframes_info)}")
-                print(f"   Cooldown setting: {self.keyframe_cooldown} frames\n")
-            elif key == ord('+') or key == ord('='):
-                self.keyframe_cooldown += 10
-                print(f"⬆️ Cooldown increased to {self.keyframe_cooldown} frames (fewer keyframes)")
-            elif key == ord('-') or key == ord('_'):
-                self.keyframe_cooldown = max(5, self.keyframe_cooldown - 10)
-                print(f"⬇️ Cooldown decreased to {self.keyframe_cooldown} frames (more keyframes)")
-        
+                # Adjust rotation sensitivity dynamically based on current FPS
+                self.adjust_rotation_sensitivity(fps)
+
+            # Display handling
+            if IN_COLAB:
+                # Update display every 30 frames in Colab (to avoid overwhelming the notebook)
+                if frame_counter % 30 == 0:
+                    top_map = self.draw_top_view(scale=100, size=900, fps=fps)
+                    top_map_rgb = cv2.cvtColor(top_map, cv2.COLOR_BGR2RGB)
+                    display_handle.update(Image.fromarray(top_map_rgb))
+
+                    # Print stats
+                    print(f"Frame: {self.frame_count} | FPS: {fps:.1f} | "
+                          f"Rot.Sens: {self.ROTATION_SENSITIVITY:.3f} | "
+                          f"Dist: {self.path_distance:.2f}m | "
+                          f"KFs: {len(self.keyframes_info) + (1 if self.current_keyframe else 0)}")
+            else:
+                # Local display - show both camera view and top view
+                vis = self.draw_camera_view(frame, self.prev_depth)
+                cv2.imshow("Camera View - Tuned Keyframes", vis)
+
+                top_map = self.draw_top_view(scale=100, size=900, fps=fps)
+                cv2.imshow("Top View - Balanced Keyframe Density", top_map)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:
+                    break
+                elif key == ord('s') or key == ord('S'):
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    map_img = self.draw_top_view(scale=100, size=900, fps=None)
+                    map_filename = f"slam_tuned_{timestamp}.png"
+                    cv2.imwrite(map_filename, map_img)
+                    print(f"✅ Saved: {map_filename}")
+                elif key == ord('p') or key == ord('P'):
+                    print(f"\n📊 STATISTICS:")
+                    print(f"   Frame: {self.frame_count}")
+                    print(f"   Distance: {self.path_distance:.3f}m")
+                    print(f"   FPS: {fps:.1f}")
+                    print(f"   Rotation Sensitivity: {self.ROTATION_SENSITIVITY:.3f}")
+                    print(f"   Keyframes (stored): {len(self.keyframes_info)}")
+                    print(f"   Cooldown setting: {self.keyframe_cooldown} frames\n")
+                elif key == ord('+') or key == ord('='):
+                    self.keyframe_cooldown += 10
+                    print(f"⬆️ Cooldown increased to {self.keyframe_cooldown} frames (fewer keyframes)")
+                elif key == ord('-') or key == ord('_'):
+                    self.keyframe_cooldown = max(5, self.keyframe_cooldown - 10)
+                    print(f"⬇️ Cooldown decreased to {self.keyframe_cooldown} frames (more keyframes)")
+
         cap.release()
-        cv2.destroyAllWindows()
+        if not IN_COLAB:
+            cv2.destroyAllWindows()
 
         # Shutdown thread pool
         self.executor.shutdown(wait=True)
@@ -1258,5 +1317,89 @@ def build_map_menu():
         else:
             print("❌ File not found")
 
+# =============== GOOGLE COLAB CONVENIENCE FUNCTION ===============
+def run_colab_slam(video_path,
+                   max_frames=None,
+                   target_w=1280,
+                   target_h=720,
+                   rotation_sensitivity=1.05,
+                   keyframe_cooldown=30):
+    """
+    Convenience function for running SLAM in Google Colab
+
+    Args:
+        video_path: Path to video file
+        max_frames: Maximum frames to process (None = entire video)
+        target_w: Target width (default 1280)
+        target_h: Target height (default 720)
+        rotation_sensitivity: Base rotation sensitivity (default 1.05 for 15fps reference)
+        keyframe_cooldown: Minimum frames between keyframes (default 30)
+
+    Example usage in Colab:
+        from google.colab import drive
+        drive.mount('/content/drive')
+
+        run_colab_slam(
+            video_path='/content/drive/MyDrive/your_video.mp4',
+            max_frames=1000,  # Process first 1000 frames
+            target_w=1280,
+            target_h=720,
+            rotation_sensitivity=1.05,
+            keyframe_cooldown=30
+        )
+    """
+    print(f"🎬 Loading video: {video_path}")
+    print(f"📐 Target resolution: {target_w}x{target_h}")
+    print(f"🎯 Max frames: {max_frames if max_frames else 'All'}")
+    print(f"🔄 Base rotation sensitivity: {rotation_sensitivity} @ 15fps")
+
+    # Calculate camera intrinsics based on target resolution
+    cx = target_w / 2.0
+    cy = target_h / 2.0
+    fx = target_w * 0.8  # Approximate focal length
+    fy = target_h * 0.8
+
+    slam = TunedFeatureTrackingSLAM(
+        fx=fx, fy=fy, cx=cx, cy=cy,
+        min_features_per_frame=30,
+        max_features_per_frame=200,  # Increased for higher resolution
+        rotation_sensitivity=rotation_sensitivity,
+        feature_lifetime_frames=50,
+        max_depth_threshold=3.0,
+        spatial_grid_size=0.10,
+        tracked_feature_threshold=20,
+        distance_threshold=0.3,
+        rotation_threshold=30.0,
+        feature_coverage_threshold=0.6,
+        keyframe_cooldown=keyframe_cooldown,
+        local_map_size=10
+    )
+
+    slam.run_slam(
+        source=video_path,
+        target_w=target_w,
+        target_h=target_h,
+        max_frames=max_frames
+    )
+
+    # Return SLAM object for analysis
+    return slam
+
 if __name__ == "__main__":
-    main_menu()
+    if not IN_COLAB:
+        main_menu()
+    else:
+        print("\n" + "="*80)
+        print("🌐 Running in Google Colab")
+        print("="*80)
+        print("Use the run_colab_slam() function to process your video:")
+        print("")
+        print("Example:")
+        print("  slam = run_colab_slam(")
+        print("      video_path='your_video.mp4',")
+        print("      max_frames=1000,")
+        print("      target_w=1280,")
+        print("      target_h=720,")
+        print("      rotation_sensitivity=1.05")
+        print("  )")
+        print("="*80)

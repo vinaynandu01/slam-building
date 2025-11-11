@@ -787,11 +787,12 @@ class TunedFeatureTrackingSLAM:
     def adjust_rotation_sensitivity(self, current_fps):
         """Dynamically adjust rotation sensitivity based on FPS
 
-        If FPS increases, rotation sensitivity should increase proportionally
-        to maintain consistent rotation behavior
+        If FPS increases, rotation sensitivity should DECREASE proportionally
+        to maintain consistent rotation behavior (higher FPS = less time between frames)
         """
         if current_fps > 0:
-            self.ROTATION_SENSITIVITY = self.BASE_ROTATION_SENSITIVITY * (current_fps / self.BASE_FPS)
+            # Inverse relationship: higher FPS needs LOWER sensitivity
+            self.ROTATION_SENSITIVITY = self.BASE_ROTATION_SENSITIVITY * (self.BASE_FPS / current_fps)
 
     def update(self, gray, frame_bgr):
         img_height, img_width = gray.shape

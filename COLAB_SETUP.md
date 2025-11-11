@@ -121,14 +121,15 @@ for kf_id, kf_info in slam.keyframes_info.items():
 The rotation sensitivity adjusts automatically based on FPS:
 
 ```
-adjusted_sensitivity = base_sensitivity × (current_fps / reference_fps)
+adjusted_sensitivity = base_sensitivity × (reference_fps / current_fps)
 ```
 
 - **Reference FPS**: 15fps (midpoint of 12-19fps from your laptop)
 - **Base sensitivity**: 1.05 (your calibrated value)
-- **At 30fps**: sensitivity will be `1.05 × (30/15) = 2.10`
+- **At 30fps**: sensitivity will be `1.05 × (15/30) = 0.525` (LOWER for higher FPS)
+- **At 12fps**: sensitivity will be `1.05 × (15/12) = 1.313` (HIGHER for lower FPS)
 
-This ensures consistent rotation behavior regardless of processing speed!
+**Why inverse?** Higher FPS = less time between frames = smaller optical flow displacements. We need LOWER sensitivity to compensate and maintain consistent rotation behavior!
 
 ## Parameters Explained
 

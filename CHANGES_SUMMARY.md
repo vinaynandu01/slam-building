@@ -92,15 +92,18 @@ Your laptop ran at 12-19 FPS with rotation_sensitivity=1.05, but Colab GPU runs 
 self.BASE_ROTATION_SENSITIVITY = 1.05  # Your calibrated value
 self.BASE_FPS = 15.0  # Reference FPS (midpoint of 12-19)
 
-# Dynamic adjustment every frame
+# Dynamic adjustment every frame (INVERSE relationship!)
 def adjust_rotation_sensitivity(self, current_fps):
-    self.ROTATION_SENSITIVITY = self.BASE_ROTATION_SENSITIVITY * (current_fps / self.BASE_FPS)
+    # Higher FPS needs LOWER sensitivity (less time between frames)
+    self.ROTATION_SENSITIVITY = self.BASE_ROTATION_SENSITIVITY * (self.BASE_FPS / current_fps)
 ```
 
 **Examples:**
 - At 15 FPS: `1.05 × (15/15) = 1.05` ✅ Same as your calibration
-- At 30 FPS: `1.05 × (30/15) = 2.10` ✅ Doubles sensitivity for doubled FPS
-- At 12 FPS: `1.05 × (12/15) = 0.84` ✅ Reduces sensitivity for slower FPS
+- At 30 FPS: `1.05 × (15/30) = 0.525` ✅ LOWER sensitivity for higher FPS
+- At 12 FPS: `1.05 × (15/12) = 1.313` ✅ HIGHER sensitivity for lower FPS
+
+**Why inverse?** Higher FPS = less time between frames = smaller optical flow pixel displacements. We need LOWER sensitivity to compensate!
 
 **Result:** Rotation behavior stays consistent regardless of processing speed!
 
